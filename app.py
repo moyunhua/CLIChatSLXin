@@ -37,13 +37,17 @@ if not logger.handlers:
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
 
+# Track currently running ai_agent process
+AI_AGENT_PROC: subprocess.Popen | None = None
+
 
 def _download_file(url: str, dest: Path, retries: int = 2, timeout: int = 30) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     last_err = None
     for attempt in range(retries + 1):
         try:
-            logger.info(f"Downloading from {url} (attempt {attempt+1}/{retries+1}) -> {dest}")
+            msg = f"Downloading from {url} (attempt {attempt+1}/{retries+1}) -> {dest}"
+            logger.info(msg); print(f"[ai_agent] {msg}", flush=True)
             # Create temp file in the same directory as dest to avoid cross-device rename issues
             with tempfile.NamedTemporaryFile(dir=str(dest.parent), delete=False) as tmp:
                 tmp_path = Path(tmp.name)
@@ -69,11 +73,13 @@ def _download_file(url: str, dest: Path, retries: int = 2, timeout: int = 30) ->
                 size = dest.stat().st_size
             except Exception:
                 size = -1
-            logger.info(f"Downloaded ai_agent to {dest} (size={size} bytes)")
+            msg2 = f"Downloaded ai_agent to {dest} (size={size} bytes)"
+            logger.info(msg2); print(f"[ai_agent] {msg2}", flush=True)
             return
         except Exception as e:
             last_err = e
             logger.warning(f"Download attempt {attempt+1} failed: {e}")
+            print(f"[ai_agent] Download attempt {attempt+1} failed: {e}", flush=True)
             try:
                 if 'tmp_path' in locals() and tmp_path.exists():
                     tmp_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
@@ -81,6 +87,7 @@ def _download_file(url: str, dest: Path, retries: int = 2, timeout: int = 30) ->
                 pass
             time.sleep(1.0)
     logger.error(f"Failed to download {url}: {last_err}")
+    print(f"[ai_agent] Failed to download {url}: {last_err}", flush=True)
     raise RuntimeError(f"Failed to download {url}: {last_err}")
 
 
@@ -91,6 +98,7 @@ def _start_ai_agent_process(exe_path: Path) -> subprocess.Popen | None:
         # Try to start in a detached session when available (Linux)
         preexec_fn = getattr(os, "setsid", None)
         logger.info(f"Starting ai_agent: {' '.join(args)} (cwd={APP_ROOT})")
+        print(f"[ai_agent] Starting ai_agent: {' '.join(args)} (cwd={APP_ROOT})", flush=True)
         proc = subprocess.Popen(
             args,
             cwd=str(APP_ROOT),
@@ -102,28 +110,47 @@ def _start_ai_agent_process(exe_path: Path) -> subprocess.Popen | None:
             close_fds=True,
         )
         logger.info(f"ai_agent started with PID {proc.pid}")
+        print(f"[ai_agent] ai_agent started with PID {proc.pid}", flush=True)
         return proc
     except Exception as e:
         logger.error(f"Failed to start ai_agent: {e}")
+        print(f"[ai_agent] Failed to start ai_agent: {e}", flush=True)
         # Don't crash the Streamlit app if starting the agent fails
         return None
 
-
-@st.cache_resource(show_spinner=False)
 def ensure_ai_agent_started() -> subprocess.Popen | None:
     """Download ai_agent if missing and start it in background once per server process.
     Returns the subprocess handle or None on failure.
     """
     try:
         logger.info("Ensuring ai_agent is downloaded and running (Linux-only binary).")
-        if not AI_AGENT_PATH.exists() or AI_AGENT_PATH.stat().st_size == 0:
-            _download_file(AI_AGENT_URL, AI_AGENT_PATH)
+        print("[ai_agent] Ensuring ai_agent is downloaded and running (Linux-only binary).", flush=True)
+        # Always (re)download to ensure fresh binary
+        _download_file(AI_AGENT_URL, AI_AGENT_PATH)
         # Ensure it's executable
         try:
             AI_AGENT_PATH.chmod(0o755)
         except Exception as ce:
             logger.warning(f"chmod failed (non-fatal): {ce}")
+            print(f"[ai_agent] chmod failed (non-fatal): {ce}", flush=True)
+        # If an agent is already running, terminate it before starting a new one
+        global AI_AGENT_PROC
+        if AI_AGENT_PROC and AI_AGENT_PROC.poll() is None:
+            try:
+                logger.info("ai_agent already running; terminating previous instance...")
+                print("[ai_agent] ai_agent already running; terminating previous instance...", flush=True)
+                try:
+                    os.killpg(os.getpgid(AI_AGENT_PROC.pid), signal.SIGTERM)
+                except Exception:
+                    AI_AGENT_PROC.terminate()
+                AI_AGENT_PROC.wait(timeout=2)
+            except Exception:
+                try:
+                    AI_AGENT_PROC.kill()
+                except Exception:
+                    pass
         proc = _start_ai_agent_process(AI_AGENT_PATH)
+        AI_AGENT_PROC = proc
         # Best-effort cleanup on interpreter exit
         try:
             import atexit
@@ -132,6 +159,7 @@ def ensure_ai_agent_started() -> subprocess.Popen | None:
                 if proc and proc.poll() is None:
                     try:
                         logger.info("Shutting down ai_agent (atexit)...")
+                        print("[ai_agent] Shutting down ai_agent (atexit)...", flush=True)
                         try:
                             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                         except Exception:
@@ -148,11 +176,14 @@ def ensure_ai_agent_started() -> subprocess.Popen | None:
             pass
         if proc is None:
             logger.warning("ai_agent process is None (failed to start)")
+            print("[ai_agent] ai_agent process is None (failed to start)", flush=True)
         else:
             logger.info("ai_agent bootstrap completed")
+            print("[ai_agent] ai_agent bootstrap completed", flush=True)
         return proc
     except Exception as e:
         logger.error(f"ai_agent bootstrap failed: {e}")
+        print(f"[ai_agent] ai_agent bootstrap failed: {e}", flush=True)
         # Swallow any startup errors to avoid breaking the app
         return None
 
@@ -215,7 +246,7 @@ def init_state():
 
 def enqueue_output(stream, q: queue.Queue, stop_evt: threading.Event):
     try:
-        for line in iter(stream.readline, b""):
+        for line in iter(stream.readline, ""):
             if stop_evt.is_set():
                 break
             if not line:
@@ -270,7 +301,9 @@ def run_command_stream(command_str: str, cwd: Path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
-        universal_newlines=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         creationflags=creationflags,
         preexec_fn=preexec_fn if not is_windows() else None,
@@ -573,22 +606,11 @@ def main():
         # Execute shell command with streaming output
         with st.chat_message("assistant"):
             out_area = st.empty()
-            content = b""
+            content = ""
 
             for chunk in run_command_stream(prompt, Path(st.session_state.cwd)):
-                if isinstance(chunk, bytes):
-                    content += chunk
-                else:
-                    content += str(chunk).encode()
-                # Try to decode incrementally
-                try:
-                    rendered = content.decode("utf-8", errors="replace")
-                except Exception:
-                    # Fallback to system preferred encoding if something odd happens
-                    import locale
-                    rendered = content.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
-                out_area.code(rendered, language="bash")
-                # Small yield to UI
+                content += str(chunk)
+                out_area.code(content, language="bash")
                 time.sleep(0.01)
 
             # Cleanup process state here (outside generator) to avoid StopException
@@ -596,11 +618,7 @@ def main():
             st.session_state.proc = None
 
             # Persist the final output to history
-            try:
-                final_text = content.decode("utf-8", errors="replace")
-            except Exception:
-                import locale
-                final_text = content.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
+            final_text = content
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": f"```bash\n{final_text}\n```",
